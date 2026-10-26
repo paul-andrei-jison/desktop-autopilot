@@ -4,3 +4,5 @@ piper-tts
 sounddevice
 pycaw
 comtypes
+PySide6
+vosk
