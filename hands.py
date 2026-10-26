@@ -207,11 +207,52 @@ def toggle_mute(mute: bool) -> str:
     return "Audio muted" if mute else "Audio unmuted"
 
 
+def _write_launcher() -> Path:
+    """Write launch_max.vbs in the project root and return its path.
+
+    The Run key starts programs in C:\\Windows\\System32, so the VBScript sets the working
+    directory explicitly and runs pythonw.exe with window style 0 (hidden) - no console at all.
+    """
+    root = Path(__file__).resolve().parent
+    venv_python = root / "venv" / "Scripts" / "pythonw.exe"
+    if venv_python.exists():
+        python = venv_python
+    else:  # no venv: use the pythonw beside the interpreter running us (python.exe would show a console)
+        exe = Path(sys.executable).resolve()
+        python = exe.with_name("pythonw.exe") if exe.with_name("pythonw.exe").exists() else exe
+    ollama = shutil.which("ollama") or "ollama"
+    script = (
+        'Set WshShell = CreateObject("WScript.Shell")\r\n'
+        f'WshShell.CurrentDirectory = "{root}"\r\n'
+        "\r\n"
+        "Function OllamaUp()\r\n"
+        "    OllamaUp = False\r\n"
+        "    On Error Resume Next\r\n"
+        '    Set http = CreateObject("WinHttp.WinHttpRequest.5.1")\r\n'
+        '    http.Open "GET", "http://127.0.0.1:11434/", False\r\n'
+        "    http.SetTimeouts 1000, 1000, 1000, 1000\r\n"
+        "    http.Send\r\n"
+        "    If Err.Number = 0 Then OllamaUp = True\r\n"
+        "End Function\r\n"
+        "\r\n"
+        "If Not OllamaUp() Then\r\n"
+        f'    WshShell.Run """" & "{ollama}" & """ serve", 0, False\r\n'
+        "    For i = 1 To 30\r\n"
+        "        WScript.Sleep 1000\r\n"
+        "        If OllamaUp() Then Exit For\r\n"
+        "    Next\r\n"
+        "End If\r\n"
+        "\r\n"
+        f'WshShell.Run """" & "{python}" & """ brain.py", 0, False\r\n'
+    )
+    vbs = root / "launch_max.vbs"
+    vbs.write_text(script, encoding="mbcs", newline="")
+    return vbs
+
+
 def _startup_command():
-    """Command line Windows runs at login: the venv's pythonw (no console window) + brain.py."""
-    venv_python = Path(__file__).parent / "venv" / "Scripts" / "pythonw.exe"
-    python = venv_python if venv_python.exists() else Path(sys.executable)
-    return f'"{python}" "{Path(__file__).parent / "brain.py"}"'
+    """Command line Windows runs at login: wscript.exe running the launcher."""
+    return f'wscript.exe "{_write_launcher()}"'
 
 
 def enable_startup_launch() -> str:

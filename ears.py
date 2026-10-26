@@ -7,10 +7,12 @@ import zipfile
 from pathlib import Path
 from urllib.request import urlopen
 
+import numpy as np
 import sounddevice as sd
+from faster_whisper import WhisperModel
 from vosk import KaldiRecognizer, Model, SetLogLevel
 
-from audio_config import INPUT  # also sets sounddevice's default devices on import
+from audio_config import open_with_retry  # also sets sounddevice's default devices on import
 
 MODEL_NAME = "vosk-model-small-en-us-0.15"
 MODEL_DIR = Path(__file__).parent / "models" / "vosk"
@@ -18,6 +20,12 @@ MODEL_URL = f"https://alphacephei.com/vosk/models/{MODEL_NAME}.zip"
 
 SAMPLE_RATE = 16000
 BLOCK_FRAMES = 2000  # 125 ms of audio per read: responsive wake/stop detection
+
+# Command capture: end of speech = this much trailing silence.
+END_SILENCE_S = 1.0
+MIN_SPEECH_RMS = 250        # int16 RMS below this is never speech
+SPEECH_FLOOR_RATIO = 2.5    # ...and speech must be this many times the noise floor
+WHISPER_MODEL = "base.en"
 
 TRIGGER_COOLDOWN_S = 1.0  # ignore repeat triggers right after one fires
 WAKE_WORD = "max"
@@ -48,35 +56,67 @@ def ensure_model(name=MODEL_NAME, model_dir=MODEL_DIR):
     return target
 
 
-class _Capture:
-    """Records one spoken command using the full-vocabulary recognizer."""
+def _load_whisper():
+    """Load faster-whisper once: on the GPU if CUDA is available, else int8 on the CPU."""
+    try:
+        import ctranslate2
+        cuda = ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        cuda = False
+    if cuda:
+        try:
+            return WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
+        except Exception as e:
+            print(f"[whisper: CUDA unavailable ({e}); using CPU]")
+    return WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
 
-    def __init__(self, model, first_word_timeout, max_seconds):
-        self.rec = KaldiRecognizer(model, SAMPLE_RATE)
+
+class _Capture:
+    """Records one spoken command until the speaker falls silent.
+
+    Endpointing is energy based: the noise floor is tracked as the quietest block seen,
+    and speech is anything clearly above it. Whisper does the actual transcription later.
+    """
+
+    def __init__(self, first_word_timeout, max_seconds):
         self.first_word_timeout = first_word_timeout
         self.max_seconds = max_seconds
         self.started = time.monotonic()
+        self.blocks = []
+        self.noise_floor = None
         self.heard_speech = False
+        self.silent_blocks = 0
         self.finished = False
-        self.result = queue.Queue(maxsize=1)
+        self.result = queue.Queue(maxsize=1)  # holds float32 audio, or None
 
-    def _finish(self, text):
+    def _finish(self, audio):
         self.finished = True
-        self.result.put(text or None)
+        self.result.put(audio)
 
     def feed(self, data):
+        if self.finished:
+            return
+        samples = np.frombuffer(data, dtype=np.int16)
+        level = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+        self.noise_floor = level if self.noise_floor is None else min(self.noise_floor, level)
+        speaking = level > max(MIN_SPEECH_RMS, self.noise_floor * SPEECH_FLOOR_RATIO)
         elapsed = time.monotonic() - self.started
-        if self.rec.AcceptWaveform(data):  # Vosk detected the end of an utterance
-            text = json.loads(self.rec.Result()).get("text", "").strip()
-            if text:
-                return self._finish(text)
-        elif json.loads(self.rec.PartialResult()).get("partial"):
-            self.heard_speech = True
 
-        if not self.heard_speech and elapsed > self.first_word_timeout:
-            self._finish(None)  # nobody said anything
-        elif elapsed > self.max_seconds:
-            self._finish(json.loads(self.rec.FinalResult()).get("text", "").strip())
+        if speaking:
+            self.heard_speech = True
+            self.silent_blocks = 0
+        elif self.heard_speech:
+            self.silent_blocks += 1
+        if self.heard_speech:
+            self.blocks.append(samples)
+
+        if not self.heard_speech:
+            if elapsed > self.first_word_timeout:
+                self._finish(None)  # nobody said anything
+        elif (self.silent_blocks * BLOCK_FRAMES / SAMPLE_RATE >= END_SILENCE_S
+              or elapsed > self.max_seconds):
+            audio = np.concatenate(self.blocks).astype(np.float32) / 32768.0
+            self._finish(audio)
 
 
 class Ears:
@@ -94,6 +134,7 @@ class Ears:
         self.on_trigger = on_trigger
         self._source = source
         self.model = Model(str(ensure_model()))
+        self.whisper = _load_whisper()
         self._wake = KaldiRecognizer(self.model, SAMPLE_RATE)
         self._capture = None
         self._last_trigger = 0.0
@@ -108,10 +149,14 @@ class Ears:
         if self._source is not None:
             yield from self._source
             return
-        with sd.RawInputStream(
-            samplerate=SAMPLE_RATE, blocksize=BLOCK_FRAMES, device=INPUT,
-            channels=1, dtype="int16",
-        ) as stream:
+        stream = open_with_retry(
+            lambda device: sd.RawInputStream(
+                samplerate=SAMPLE_RATE, blocksize=BLOCK_FRAMES, device=device,
+                channels=1, dtype="int16",
+            ),
+            "input",
+        )
+        with stream:
             while True:
                 data, _overflowed = stream.read(BLOCK_FRAMES)
                 yield bytes(data)
@@ -166,23 +211,40 @@ class Ears:
 
     def listen_for_command(self, first_word_timeout=5.0, max_seconds=20.0):
         """Block until the user speaks a full command; None if they stay silent."""
-        cap = _Capture(self.model, first_word_timeout, max_seconds)
+        cap = _Capture(first_word_timeout, max_seconds)
         self._capture = cap
         try:
-            return cap.result.get()
+            audio = cap.result.get()
         finally:
             self._capture = None
+        if audio is None:
+            return None
+        # Transcribed here, on the caller's thread, so the mic/wake loop never stalls.
+        segments, _info = self.whisper.transcribe(
+            audio, language="en", beam_size=5, vad_filter=True, condition_on_previous_text=False
+        )
+        return " ".join(seg.text.strip() for seg in segments).strip() or None
 
 
 if __name__ == "__main__":
+    # Live test: say "max", then a command; the Whisper transcript is printed.
+    fired = threading.Event()
+
     def show(kind):
         print(f"  -> trigger heard: {kind!r}")
+        if kind == "max":
+            fired.set()
 
     ears = Ears(show)
     ears.start()
-    print("Say 'max' (or 'stop'). Ctrl+C to quit.")
+    print("Say 'max', then your command. Ctrl+C to quit.")
     try:
         while True:
-            time.sleep(0.2)
+            if fired.wait(0.2):
+                fired.clear()
+                print("  listening ...")
+                t0 = time.monotonic()
+                text = ears.listen_for_command(first_word_timeout=5.0)
+                print(f"  heard: {text!r}  ({time.monotonic() - t0:.1f}s incl. transcription)")
     except KeyboardInterrupt:
         pass

@@ -8,7 +8,7 @@ import numpy as np
 import sounddevice as sd
 from piper import PiperVoice
 
-from audio_config import OUTPUT  # also sets sounddevice's default devices on import
+from audio_config import OUTPUT, open_with_retry  # also sets sounddevice's default devices on import
 
 VOICE_NAME = "en_US-danny-low"  # <lang>_<REGION>-<voice>-<quality>
 MODEL_DIR = Path(__file__).parent / "models" / "tts"
@@ -101,9 +101,13 @@ class SpeechQueue:
     def _play_worker(self):
         # One stream stays open for the whole session: no per-sentence startup delay.
         chunk = int(self._mouth.sample_rate * self.PLAY_CHUNK_S)
-        with sd.OutputStream(
-            samplerate=self._mouth.sample_rate, device=OUTPUT, channels=1, dtype="int16"
-        ) as stream:
+        stream = open_with_retry(
+            lambda device: sd.OutputStream(
+                samplerate=self._mouth.sample_rate, device=device, channels=1, dtype="int16"
+            ),
+            "output",
+        )
+        with stream:
             while True:
                 item = self._audio.get()
                 try:

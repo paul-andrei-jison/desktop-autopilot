@@ -6,3 +6,5 @@ pycaw
 comtypes
 PySide6
 vosk
+faster-whisper
+numpy

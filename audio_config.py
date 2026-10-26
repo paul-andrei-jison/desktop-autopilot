@@ -1,4 +1,6 @@
 """Which microphone and speaker Bart uses (IDs come from `python list_devices.py`)."""
+import time
+
 import sounddevice as sd
 
 INPUT_DEVICE = 1    # Headset (Soundcore Life Q35) mic, MME
@@ -42,6 +44,28 @@ def configure():
     # Fallback for any code that doesn't pass device= explicitly (None keeps the system default).
     sd.default.device = (inp, out)
     return inp, out
+
+
+def open_with_retry(make_stream, kind, attempts=5, delay=2.0):
+    """Open an audio stream, retrying while Bluetooth/HDMI devices finish connecting after login.
+
+    `make_stream(device)` builds the stream; the device ID is re-resolved on every attempt
+    because Windows may renumber devices once the headset appears.
+    """
+    for attempt in range(1, attempts + 1):
+        device = INPUT if kind == "input" else OUTPUT
+        try:
+            return make_stream(device)
+        except Exception as e:
+            print(f"[audio] {kind} device {device} not ready (attempt {attempt}/{attempts}): {e}")
+            if attempt == attempts:
+                raise
+            time.sleep(delay)
+            globals()["INPUT" if kind == "input" else "OUTPUT"] = _resolve(
+                INPUT_DEVICE if kind == "input" else OUTPUT_DEVICE,
+                kind,
+                INPUT_NAME_HINT if kind == "input" else OUTPUT_NAME_HINT,
+            )
 
 
 # Runs once on import, so every module sees the same devices.

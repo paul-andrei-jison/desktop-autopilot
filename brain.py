@@ -1,8 +1,29 @@
+import os
 import re
 import signal
 import sys
 import threading
+import traceback
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+LOG_PATH = PROJECT_ROOT / "bart.log"
+
+
+def _log_exception(exc_type, exc, tb):
+    """Append an unhandled exception to bart.log (absolute path, independent of the cwd)."""
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write("[unhandled exception]\n")
+            f.write("".join(traceback.format_exception(exc_type, exc, tb)))
+    except OSError:
+        pass
+
+
+# Installed before the heavy imports so a failed import at startup is logged too.
+os.chdir(PROJECT_ROOT)  # relative paths (models, config) must not depend on the launch directory
+sys.excepthook = _log_exception
+threading.excepthook = lambda a: _log_exception(a.exc_type, a.exc_value, a.exc_traceback)
 
 import ollama
 from PySide6.QtCore import QMetaObject, Qt, QTimer
@@ -371,7 +392,7 @@ def assistant_loop(ui, ears, speech, quit_app):
 def _setup_logging():
     """Under pythonw there is no console, so write output to bart.log instead."""
     if sys.stdout is None or sys.stderr is None:
-        log = open(Path(__file__).with_name("bart.log"), "a", buffering=1, encoding="utf-8")
+        log = open(LOG_PATH, "a", buffering=1, encoding="utf-8")
         sys.stdout = sys.stderr = log
 
 
@@ -404,4 +425,4 @@ def main(source=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main())  # an exception here reaches sys.excepthook, which logs it
