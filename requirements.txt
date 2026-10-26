@@ -2,3 +2,5 @@ ollama
 onnxruntime
 piper-tts
 sounddevice
+pycaw
+comtypes
